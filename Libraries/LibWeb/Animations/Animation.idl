@@ -1,0 +1,55 @@
+// https://drafts.csswg.org/web-animations-1/#the-animation-interface
+[Exposed=Window]
+interface Animation : EventTarget {
+    [ImplementedInBindings, NeedsArgumentCount] constructor(optional AnimationEffect? effect = null,
+                optional AnimationTimeline? timeline);
+
+    attribute [FlyString] DOMString id;
+    [DirectGetter] attribute AnimationEffect? effect;
+    [ImplementedAs=timeline_for_bindings] attribute AnimationTimeline? timeline;
+    [ImplementedAs=start_time_for_bindings] attribute CSSNumberish? startTime;
+    [ImplementedAs=current_time_for_bindings] attribute CSSNumberish? currentTime;
+    attribute double playbackRate;
+    [ImplementedAs=range_start_for_bindings] attribute (TimelineRangeOffset or CSSNumericValue or CSSKeywordValue or DOMString) rangeStart;
+    [ImplementedAs=range_end_for_bindings] attribute (TimelineRangeOffset or CSSNumericValue or CSSKeywordValue or DOMString) rangeEnd;
+    [ImplementedAs=play_state_for_bindings] readonly attribute AnimationPlayState playState;
+    readonly attribute AnimationReplaceState replaceState;
+    [ImplementedAs=pending_for_bindings] readonly attribute boolean pending;
+    [ImplementedAs=ready_for_bindings] readonly attribute Promise<Animation> ready;
+    [ImplementedAs=finished_for_bindings] readonly attribute Promise<Animation> finished;
+
+    attribute EventHandler onfinish;
+    attribute EventHandler oncancel;
+    attribute EventHandler onremove;
+
+    undefined cancel();
+    undefined finish();
+    undefined play();
+    undefined pause();
+    undefined updatePlaybackRate(double playbackRate);
+    undefined reverse();
+    undefined persist();
+    [FIXME, CEReactions] undefined commitStyles();
+};
+
+// https://drafts.csswg.org/web-animations-2/#dictdef-timelinerangeoffset
+dictionary TimelineRangeOffset {
+    CSSOMString? rangeName;
+    CSSNumericValue offset;
+};
+
+// https://drafts.csswg.org/web-animations-1/#the-animationplaystate-enumeration
+enum AnimationPlayState { "idle", "running", "paused", "finished" };
+
+// https://drafts.csswg.org/web-animations-1/#the-animationreplacestate-enumeration
+enum AnimationReplaceState { "active", "removed", "persisted" };
+
+// https://drafts.csswg.org/web-animations-1/#extensions-to-the-document-interface
+partial interface Document {
+    readonly attribute DocumentTimeline timeline;
+};
+
+// https://drafts.csswg.org/web-animations-1/#extensions-to-the-documentorshadowroot-interface-mixin
+partial interface mixin DocumentOrShadowRoot {
+    sequence<Animation> getAnimations();
+};

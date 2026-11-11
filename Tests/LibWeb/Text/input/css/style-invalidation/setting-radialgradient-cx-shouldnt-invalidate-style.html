@@ -1,0 +1,19 @@
+<!doctype html>
+<svg width="200" height="120">
+    <defs>
+        <radialGradient id="gradient" cx="25%" cy="50%" r="50%"></radialGradient>
+    </defs>
+</svg>
+<script src="../../include.js"></script>
+<script>
+    test(() => {
+        internals.updateStyle();
+        internals.resetStyleCounters();
+
+        gradient.setAttribute("cx", "75%");
+
+        internals.updateStyle();
+        const styled = internals.styleCounters().styledElements;
+        println(styled == 0 ? "PASS" : `FAIL: styled ${styled} elements`);
+    });
+</script>

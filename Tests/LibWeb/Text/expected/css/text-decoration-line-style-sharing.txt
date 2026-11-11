@@ -1,0 +1,4 @@
+none
+none
+none
+spans taking another's record >= 2: true

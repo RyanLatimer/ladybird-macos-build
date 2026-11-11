@@ -1,0 +1,38 @@
+$676feeea delete-expression-register.js:6:1
+  Registers: 7
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+    [1] = Int32(1)
+
+block0:
+  [   0] Enter
+  [   8] Mov dst:reg5, src:Undefined
+  [  18] GetGlobal value_feedback:0, dst:reg6, `f`
+  [  28] Call value_feedback:1, call_feedback:0, dst:reg5, callee:reg6, this_value:Undefined, arguments:[Int32(1)]
+  [  50] End value:reg5
+
+
+f$9c808ee0 delete-expression-register.js:2:9
+  Registers: 7
+  Blocks:    3
+  Locals:    arguments~0, x~1
+  Constants:
+    [0] = Undefined
+    [1] = Bool(false)
+    [2] = Int32(0)
+
+block0:
+  [   0] Enter
+  [   8] CreateArguments dst:arguments~0, is_immutable:false, creates_parameter_bindings:false
+  [  18] Mov dst:x~1, src:Undefined
+  [  28] Mov dst:x~1, src:Bool(false)
+  [  38] Mov dst:reg5, src:x~1
+  [  48] JumpTrue condition:reg5, target:block2
+
+block1:
+  [  58] DeleteByValue dst:reg5, base:arguments~0, property:Int32(0)
+
+block2:
+  [  68] Mov dst:x~1, src:reg5
+  [  78] Return value:x~1

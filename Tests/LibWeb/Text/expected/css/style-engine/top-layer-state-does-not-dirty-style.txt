@@ -1,0 +1,6 @@
+shown styled: popover
+shown color: rgb(4, 5, 6)
+shown read styled: 0
+hidden styled: popover
+hidden color: rgb(1, 2, 3)
+hidden read styled: 0

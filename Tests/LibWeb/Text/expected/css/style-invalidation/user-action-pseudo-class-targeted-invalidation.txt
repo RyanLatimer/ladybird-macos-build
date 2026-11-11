@@ -1,0 +1,4 @@
+plain text hover: styled <= 0: true
+link hover: styled <= 1: true
+link color: rgb(0, 128, 0)
+active state: styled <= 4: true

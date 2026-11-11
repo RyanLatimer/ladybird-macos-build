@@ -1,0 +1,3 @@
+plain descendants styled <= 0: true
+text-decoration-line inheritor styled: 1
+transform inheritor restyled: true

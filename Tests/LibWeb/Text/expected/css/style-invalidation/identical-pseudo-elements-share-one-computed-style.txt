@@ -1,0 +1,2 @@
+identical markers: shared: 0, reused: 0
+PASS: every marker inherited its color: true

@@ -1,0 +1,105 @@
+/*
+ * Copyright (c) 2024, Matthew Olsson <mattco@serenityos.org>
+ * Copyright (c) 2024, Sam Atkins <sam@ladybird.org>
+ * Copyright (c) 2025, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/FlyString.h>
+#include <AK/HashMap.h>
+#include <AK/Utf16FlyString.h>
+#include <LibGC/RootVector.h>
+#include <LibWeb/Animations/KeyframeEffect.h>
+#include <LibWeb/Bindings/Animatable.h>
+#include <LibWeb/CSS/PropertyNameAndID.h>
+#include <LibWeb/Export.h>
+
+namespace Web::CSS {
+
+class CSSTransition;
+
+}
+
+namespace Web::Animations {
+
+// https://drafts.csswg.org/web-animations-1/#animatable
+class WEB_API Animatable {
+public:
+    virtual ~Animatable() = default;
+
+    enum class GetAnimationsSorted {
+        No,
+        Yes
+    };
+
+    struct GetAnimationsOptions {
+        bool subtree { false };
+        Optional<CSS::Selector::PseudoElementSelector> pseudo_element;
+    };
+
+    struct KeyframeAnimationOptions : public KeyframeEffect::Options {
+        Utf16FlyString id;
+        Optional<GC::Ptr<AnimationTimeline>> timeline;
+    };
+
+    WebIDL::ExceptionOr<GC::Ref<Animation>> animate(Vector<BaseKeyframe> keyframes, Variant<double, KeyframeAnimationOptions> const& options);
+    WebIDL::ExceptionOr<GC::Ref<Animation>> animate(JS::Realm&, GC::Ptr<JS::Object> keyframes, Variant<double, Bindings::KeyframeAnimationOptions> const& options);
+    WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> get_animations(GetAnimationsOptions const& options);
+    WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> get_animations(Bindings::GetAnimationsOptions const& options);
+    WebIDL::ExceptionOr<GC::RootVector<GC::Ref<Animation>>> get_animations_internal(GetAnimationsSorted sorted, GetAnimationsOptions const& options);
+    ReadonlySpan<GC::Ref<Animation>> associated_animations_in_composite_order();
+    ReadonlySpan<GC::Ref<Animation>> associated_animations_unordered() const { return m_impl ? m_impl->associated_animations.span() : ReadonlySpan<GC::Ref<Animation>> {}; }
+    void invalidate_associated_animation_composite_order();
+    bool has_relevant_animations() const;
+    bool has_associated_animations() const;
+
+    void associate_with_animation(GC::Ref<Animation>);
+    void disassociate_with_animation(GC::Ref<Animation>);
+    void on_document_changed(DOM::Document& old_document, DOM::Document& new_document);
+    void cancel_css_animations_and_transitions();
+
+    bool has_css_defined_animations() const;
+    bool has_css_animations_or_transitions() const;
+    Vector<GC::Ref<CSS::CSSAnimation>> const* css_defined_animations(Optional<CSS::PseudoElement>);
+    void set_css_defined_animations(Optional<CSS::PseudoElement>, Vector<GC::Ref<CSS::CSSAnimation>>&&);
+
+    // Whether the installed style gives any longhand a matching transition-property entry, answered without listing them.
+    bool has_matching_transition_property_entry(Optional<CSS::PseudoElement>) const;
+    void set_transition(Optional<CSS::PseudoElement>, CSS::PropertyNameAndID const&, GC::Ref<CSS::CSSTransition>);
+    void remove_transition(Optional<CSS::PseudoElement>, CSS::PropertyNameAndID const&);
+    bool has_existing_transitions(Optional<CSS::PseudoElement>) const;
+    // The running or completed transition for each property, if the element holds any.
+    HashMap<CSS::PropertyNameAndID, GC::Ref<CSS::CSSTransition>> const* existing_transitions(Optional<CSS::PseudoElement>) const;
+    GC::Ptr<CSS::CSSTransition> property_transition(Optional<CSS::PseudoElement>, CSS::PropertyNameAndID const&) const;
+
+protected:
+    void visit_edges(JS::Cell::Visitor&);
+
+private:
+    struct Transition;
+
+    struct Impl {
+        AK_ALLOC_WITH_KMALLOC;
+
+        Vector<GC::Ref<Animation>> associated_animations;
+        bool is_sorted_by_composite_order { true };
+        bool has_css_defined_animations { false };
+
+        mutable Array<OwnPtr<Vector<GC::Ref<CSS::CSSAnimation>>>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount) + 1> css_defined_animations;
+        mutable Array<OwnPtr<Transition>, to_underlying(CSS::PseudoElement::KnownPseudoElementCount) + 1> transitions;
+
+        ~Impl();
+
+        void visit_edges(JS::Cell::Visitor&);
+    };
+    Impl& ensure_impl() const;
+    Transition* ensure_transition(Optional<CSS::PseudoElement>) const;
+    Transition const* transition_if_exists(Optional<CSS::PseudoElement>) const;
+
+    mutable OwnPtr<Impl> m_impl;
+};
+
+}

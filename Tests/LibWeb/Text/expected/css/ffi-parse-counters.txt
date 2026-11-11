@@ -1,0 +1,1 @@
+computed width: 1px

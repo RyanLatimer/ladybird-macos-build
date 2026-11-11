@@ -1,0 +1,25 @@
+/*
+ * Copyright (c) 2023, MacDue <macdue@dueutil.tech>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibGC/Heap.h>
+#include <LibWeb/CSS/ElementBoxKind.h>
+#include <LibWeb/SVG/SVGTextElement.h>
+
+namespace Web::SVG {
+
+GC_DEFINE_ALLOCATOR(SVGTextElement);
+
+SVGTextElement::SVGTextElement(DOM::Document& document, DOM::QualifiedName qualified_name)
+    : SVGTextPositioningElement(document, move(qualified_name))
+{
+}
+
+CSS::ElementBoxKind SVGTextElement::box_kind() const
+{
+    return CSS::ElementBoxKind::SvgText;
+}
+
+}

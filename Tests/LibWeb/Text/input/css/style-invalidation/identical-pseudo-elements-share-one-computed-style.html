@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    li {
+        color: rgb(12, 34, 56);
+    }
+</style>
+<ul id="list"></ul>
+<script>
+    test(() => {
+        internals.updateStyle();
+        const list = document.getElementById("list");
+        for (let i = 0; i < 10; ++i) {
+            const item = document.createElement("li");
+            // Keep the originating styles distinct while leaving their inherited
+            // groups identical, which gives every marker the same complete input.
+            item.style.width = `${i}px`;
+            item.textContent = `item ${i}`;
+            list.appendChild(item);
+        }
+
+        internals.resetStyleCounters();
+        internals.updateStyle();
+
+        // FIXME: Nine of the ten identical markers should take the first one's record
+        //        (sharedElements >= 9), but the style engine counts no shared or reused pseudo-element.
+        const counters = internals.styleCounters();
+        println(`identical markers: shared: ${counters.sharedElements}, reused: ${counters.reusedElements}`);
+        println(`PASS: every marker inherited its color: ${[...list.children].every(item => getComputedStyle(item, "::marker").color === "rgb(12, 34, 56)")}`);
+    });
+</script>

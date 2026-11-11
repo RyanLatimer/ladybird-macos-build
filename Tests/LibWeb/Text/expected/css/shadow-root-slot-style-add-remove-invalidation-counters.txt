@@ -1,0 +1,2 @@
+slotted stylesheet add ignores matching bystanders outside the current host, styled <= 4: true
+slotted stylesheet remove ignores matching bystanders outside the current host, styled <= 4: true

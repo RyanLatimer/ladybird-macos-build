@@ -1,0 +1,6 @@
+insert stays selective: true
+insert opacity: 0.5
+edit stays selective: true
+edit opacity: 0.25
+delete stays selective: true
+delete opacity: 1

@@ -1,0 +1,2 @@
+[after add .descendant (no :has() in sheet)]
+  styled <= 1: true

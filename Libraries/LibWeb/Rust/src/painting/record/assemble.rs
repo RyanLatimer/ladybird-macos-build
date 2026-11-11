@@ -1,0 +1,1538 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+//! Assembles a frame from the retained paint-order tree and the pushed damage. Scopes on a
+//! damaged path are walked, clean children are copied from the published recording by range, and
+//! damaged producers are recorded again under explicit contexts. Nothing is validated on the
+//! way: when assembly starts, the damage set is complete by construction.
+
+use super::PaintPhase;
+use super::order_tree::{
+    ChildEntry, ChildKey, OutputSize, PaintOrderTree, PaintOrderTreeAccess, ProducerKind, ScopeId, ScopeMarks,
+};
+use crate::css::style::fast_hash::FastMap;
+use crate::layout::node_data::NodeSlotId;
+use crate::painting::paint_order_plan::{PaintOrderItem, PaintProducer, PaintScope, PaintScopeKind};
+use crate::painting::record::damage::PaintDamage;
+use smallvec::SmallVec;
+use std::ops::Range;
+
+/// The planner's items for one scope in paint order. Every producer belongs to the scope's
+/// owner. An inactive plan is a stacking context that does not paint; its scope records nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScopePlan {
+    pub active: bool,
+    pub items: SmallVec<[PaintOrderItem; 16]>,
+}
+
+/// A box phase in paint order is up to three producers: its hit-test items, the scroll
+/// metadata recorded with the background, and its commands. An SVG root paints its
+/// background, border and then all of its content as one producer.
+fn producer_kinds(producer: PaintProducer) -> SmallVec<[ProducerKind; 5]> {
+    use ProducerKind::*;
+    match producer {
+        PaintProducer::BoxPhase(PaintPhase::Background) => {
+            smallvec::smallvec![HitBackground, ScrollMetadata, DrawBackground]
+        }
+        PaintProducer::BoxPhase(PaintPhase::Border) => smallvec::smallvec![DrawBorder],
+        PaintProducer::BoxPhase(PaintPhase::TableCollapsedBorder) => smallvec::smallvec![DrawTableCollapsedBorder],
+        PaintProducer::BoxPhase(PaintPhase::Foreground) => smallvec::smallvec![HitForeground, DrawForeground],
+        PaintProducer::BoxPhase(PaintPhase::Outline) => smallvec::smallvec![DrawOutline],
+        PaintProducer::BoxPhase(PaintPhase::Overlay) => smallvec::smallvec![HitOverlay, DrawOverlay],
+        PaintProducer::SvgRoot => smallvec::smallvec![HitBackground, ScrollMetadata, DrawBackground, DrawBorder, Svg],
+        PaintProducer::SvgBoxForeground => smallvec::smallvec![Svg],
+        PaintProducer::ScopePreamble => smallvec::smallvec![ScopePreamble],
+        PaintProducer::ForegroundHitTest => smallvec::smallvec![HitForeground],
+        PaintProducer::ForegroundCommands => smallvec::smallvec![DrawForeground],
+        PaintProducer::InlinePiece(index) => smallvec::smallvec![InlinePiece(index)],
+        PaintProducer::TextFragment(index) => smallvec::smallvec![TextFragment(index)],
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProducerOutcome {
+    // Recorded again every frame; the entry and every scope above it stay live.
+    pub live: bool,
+    // Recorded again when the window gains or loses focus.
+    pub reads_window_focus: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScopeAction {
+    // Walked with the published child list.
+    Assembled,
+    // The plan was rebuilt and matched against the published children.
+    Replanned,
+    // Recorded without a published counterpart.
+    Recorded,
+    // The stacking context does not paint.
+    Inactive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AssemblyEvent {
+    ScopeBegin(PaintScope, ScopeAction),
+    ScopeEnd(PaintScope),
+    ScopeCopied(PaintScope),
+    ProducerCopied(NodeSlotId, ProducerKind),
+}
+
+/// The end of the output being assembled: command bytes, hit-test items and blocking wheel
+/// regions so far.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OutputPosition {
+    pub bytes: u32,
+    pub hits: u32,
+    pub blocking_wheel_event_regions: u32,
+}
+
+/// What assembly needs from the recorder, which owns the output and the published recording.
+pub(crate) trait AssemblyHost {
+    fn plan_scope(&mut self, scope: PaintScope) -> ScopePlan;
+
+    /// Records one producer of `owner` under the contexts it needs.
+    fn record_producer(&mut self, owner: NodeSlotId, kind: ProducerKind) -> ProducerOutcome;
+
+    fn output_position(&self) -> OutputPosition;
+
+    /// Appends the published recording's command bytes and hit-test items in the given ranges.
+    fn copy_published(&mut self, bytes: Range<u32>, hits: Range<u32>, blocking_wheel_event_regions: u32);
+
+    /// Every damaged row, including the rows of subtrees whose root moved.
+    fn damaged_rows(&mut self) -> Vec<NodeSlotId>;
+
+    /// The damage of a row with a moved ancestor's subtree expansion folded in.
+    fn effective_damage(&mut self, row: NodeSlotId) -> PaintDamage;
+
+    fn producer_reads_descendants(&mut self, owner: NodeSlotId, kind: ProducerKind) -> bool;
+
+    fn observe(&mut self, _event: AssemblyEvent) {}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceCursor {
+    bytes: u32,
+    hits: u32,
+}
+
+impl SourceCursor {
+    fn advance(&mut self, output: OutputSize) {
+        self.bytes += output.bytes;
+        self.hits += output.hits;
+    }
+}
+
+// Consecutive clean children are copied with one range append each for commands and items.
+#[derive(Clone, Copy)]
+struct PendingCopy {
+    start: SourceCursor,
+    end: SourceCursor,
+    blocking_wheel_event_regions: u32,
+}
+
+/// Whether the published recording can be returned as it is: nothing was pushed, nothing in it is
+/// recorded every frame or read a window focus that changed, and there is a published tree at all.
+pub(crate) fn frame_is_unchanged(tree: &PaintOrderTree, has_damage: bool, window_focus_changed: bool) -> bool {
+    let root = tree.root_entry();
+    !tree.root().is_none() && !has_damage && !root.is_live() && !(window_focus_changed && root.reads_window_focus())
+}
+
+pub(crate) struct Assembler<'a, H: AssemblyHost> {
+    host: &'a mut H,
+    // A frame that publishes nothing still marks damaged paths, but the tree's structure keeps
+    // describing the published recording.
+    tree: PaintOrderTreeAccess<'a>,
+    marks: &'a mut ScopeMarks,
+    // The byte offset of the published root scope, when a published recording can be copied from.
+    source_prologue_bytes: Option<u32>,
+    // The published recording was made in the other window focus state.
+    window_focus_changed: bool,
+    pending_copy: Option<PendingCopy>,
+}
+
+impl<'a, H: AssemblyHost> Assembler<'a, H> {
+    pub(crate) fn new(
+        host: &'a mut H,
+        tree: PaintOrderTreeAccess<'a>,
+        marks: &'a mut ScopeMarks,
+        source_prologue_bytes: Option<u32>,
+        window_focus_changed: bool,
+    ) -> Self {
+        Self {
+            host,
+            tree,
+            marks,
+            source_prologue_bytes,
+            window_focus_changed,
+            pending_copy: None,
+        }
+    }
+
+    // Copying an entry would keep output that is recorded every frame, or that read the window
+    // focus before it changed.
+    fn records_again(&self, entry: &ChildEntry) -> bool {
+        entry.is_live() || (self.window_focus_changed && entry.reads_window_focus())
+    }
+
+    /// Records the frame's root scope after the prologue and returns its output. A frame that
+    /// rewrites the tree leaves the assembled structure there as pending changes for the caller
+    /// to publish or discard.
+    pub(crate) fn assemble_root(mut self, root_scope: PaintScope) -> OutputSize {
+        self.marks.begin_recording();
+        // Damage only steers what a frame copies; a frame without a published recording to copy
+        // from records everything and never consults it.
+        if self.source_prologue_bytes.is_some() {
+            for row in self.host.damaged_rows() {
+                let tree = self.tree.read();
+                for scope in tree.scopes_owned_by(row) {
+                    tree.mark_path_to_root_damaged(scope, self.marks);
+                }
+            }
+        }
+        let published_root = self.tree.read().root();
+        let output = match self.source_prologue_bytes {
+            Some(prologue_bytes)
+                if !published_root.is_none() && self.tree.read().scope_of(published_root) == root_scope =>
+            {
+                let cursor = SourceCursor {
+                    bytes: prologue_bytes,
+                    hits: 0,
+                };
+                let entry = self.assemble_scope(published_root, cursor);
+                self.flush_pending_copy();
+                if let Some(tree) = self.tree.rewrites() {
+                    tree.finish_recording(published_root, entry);
+                }
+                entry.output()
+            }
+            _ if self.tree.is_rewriting() => {
+                let tree = self.rewritten_tree();
+                if !published_root.is_none() {
+                    tree.detach_scope(published_root);
+                }
+                let root = tree.allocate_scope(root_scope, ScopeId::NONE);
+                let entry = self.record_scope_fresh(root);
+                self.rewritten_tree().finish_recording(root, entry);
+                entry.output()
+            }
+            _ => self.record_scope_outside_tree(root_scope),
+        };
+        debug_assert!(self.pending_copy.is_none());
+        output
+    }
+
+    fn rewritten_tree(&mut self) -> &mut PaintOrderTree {
+        self.tree
+            .rewrites()
+            .expect("only a frame that rewrites the tree records into it")
+    }
+
+    fn assemble_scope(&mut self, id: ScopeId, cursor: SourceCursor) -> ChildEntry {
+        let scope = self.tree.read().scope_of(id);
+        let damage = self.host.effective_damage(scope.owner);
+        let order_damage = match scope.kind {
+            PaintScopeKind::PaintedAsStackingContext => {
+                PaintDamage::ORDER | PaintDamage::CONTEXT_ORDER | PaintDamage::ELIGIBILITY
+            }
+            PaintScopeKind::Descendants(_) => PaintDamage::ORDER,
+        };
+        if damage.intersects(order_damage) {
+            return self.rebuild_scope(id, cursor, damage);
+        }
+        self.host
+            .observe(AssemblyEvent::ScopeBegin(scope, ScopeAction::Assembled));
+        let published: SmallVec<[ChildEntry; 16]> = self.tree.read().children(id).iter().copied().collect();
+        let mut entries: SmallVec<[ChildEntry; 16]> = SmallVec::with_capacity(published.len());
+        let mut total = OutputSize::default();
+        let mut child_cursor = cursor;
+        for entry in published {
+            let published_output = entry.output();
+            let assembled = match entry.key() {
+                ChildKey::Scope(child) => {
+                    if self.marks.is_on_damaged_path(child) || self.records_again(&entry) {
+                        self.assemble_scope(child, child_cursor)
+                    } else {
+                        self.copy(child_cursor, published_output);
+                        let child_scope = self.tree.read().scope_of(child);
+                        self.host.observe(AssemblyEvent::ScopeCopied(child_scope));
+                        entry
+                    }
+                }
+                ChildKey::Producer(kind) => {
+                    if self.producer_is_damaged(scope.owner, kind, damage, &entry) {
+                        self.record_producer(scope.owner, kind)
+                    } else {
+                        self.copy(child_cursor, published_output);
+                        self.host.observe(AssemblyEvent::ProducerCopied(scope.owner, kind));
+                        entry
+                    }
+                }
+            };
+            child_cursor.advance(published_output);
+            total.add(assembled.output());
+            entries.push(assembled);
+        }
+        if let Some(tree) = self.tree.rewrites() {
+            tree.set_children(id, &entries);
+        }
+        self.host.observe(AssemblyEvent::ScopeEnd(scope));
+        ChildEntry::scope(id, total)
+    }
+
+    fn producer_is_damaged(
+        &mut self,
+        owner: NodeSlotId,
+        kind: ProducerKind,
+        damage: PaintDamage,
+        entry: &ChildEntry,
+    ) -> bool {
+        damage.intersects(kind.damage())
+            || self.records_again(entry)
+            || (damage.contains(PaintDamage::DESCENDANT_READERS) && self.host.producer_reads_descendants(owner, kind))
+    }
+
+    // The plan is rebuilt; published children it still lists are copied or walked from their
+    // old positions, the rest are recorded, and published children it no longer lists retire.
+    fn rebuild_scope(&mut self, id: ScopeId, cursor: SourceCursor, damage: PaintDamage) -> ChildEntry {
+        let scope = self.tree.read().scope_of(id);
+        let plan = self.host.plan_scope(scope);
+        let published: SmallVec<[ChildEntry; 16]> = self.tree.read().children(id).iter().copied().collect();
+        let mut published_cursors: SmallVec<[SourceCursor; 16]> = SmallVec::with_capacity(published.len());
+        let mut child_cursor = cursor;
+        for entry in &published {
+            published_cursors.push(child_cursor);
+            child_cursor.advance(entry.output());
+        }
+        let mut matched: SmallVec<[bool; 16]> = SmallVec::from_elem(false, published.len());
+        // A stacking context with thousands of hoisted children is replanned when one of them
+        // appears or disappears; matching by key must not scan the list per item.
+        let published_index_by_key: Option<FastMap<ChildKey, usize>> = (published.len() > 16).then(|| {
+            published
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.key(), index))
+                .collect()
+        });
+        let published_index_of = |key: ChildKey| match &published_index_by_key {
+            Some(index_by_key) => index_by_key.get(&key).copied(),
+            None => published.iter().position(|entry| entry.key() == key),
+        };
+        if !plan.active {
+            self.host
+                .observe(AssemblyEvent::ScopeBegin(scope, ScopeAction::Inactive));
+            self.install_replanned_children(id, &published, &matched, &[]);
+            self.host.observe(AssemblyEvent::ScopeEnd(scope));
+            return ChildEntry::scope(id, OutputSize::default());
+        }
+        self.host
+            .observe(AssemblyEvent::ScopeBegin(scope, ScopeAction::Replanned));
+        let mut entries: SmallVec<[ChildEntry; 16]> = SmallVec::with_capacity(plan.items.len());
+        let mut total = OutputSize::default();
+        for item in plan.items {
+            match item {
+                PaintOrderItem::Producer(producer) => {
+                    for kind in producer_kinds(producer) {
+                        let assembled = match published_index_of(ChildKey::Producer(kind)) {
+                            Some(index) if !self.producer_is_damaged(scope.owner, kind, damage, &published[index]) => {
+                                matched[index] = true;
+                                self.copy(published_cursors[index], published[index].output());
+                                self.host.observe(AssemblyEvent::ProducerCopied(scope.owner, kind));
+                                published[index]
+                            }
+                            Some(index) => {
+                                matched[index] = true;
+                                self.record_producer(scope.owner, kind)
+                            }
+                            None => self.record_producer(scope.owner, kind),
+                        };
+                        total.add(assembled.output());
+                        entries.push(assembled);
+                    }
+                }
+                PaintOrderItem::Scope(child_scope) => {
+                    let found = self
+                        .tree
+                        .read()
+                        .published_scope(child_scope, id)
+                        .and_then(|child| published_index_of(ChildKey::Scope(child)).map(|index| (child, index)));
+                    let assembled = match found {
+                        Some((child, index)) => {
+                            matched[index] = true;
+                            if self.marks.is_on_damaged_path(child) || self.records_again(&published[index]) {
+                                self.assemble_scope(child, published_cursors[index])
+                            } else {
+                                self.copy(published_cursors[index], published[index].output());
+                                self.host.observe(AssemblyEvent::ScopeCopied(child_scope));
+                                published[index]
+                            }
+                        }
+                        None if self.tree.is_rewriting() => {
+                            let child = self.rewritten_tree().allocate_scope(child_scope, id);
+                            self.record_scope_fresh(child)
+                        }
+                        None => {
+                            total.add(self.record_scope_outside_tree(child_scope));
+                            continue;
+                        }
+                    };
+                    total.add(assembled.output());
+                    entries.push(assembled);
+                }
+            }
+        }
+        self.install_replanned_children(id, &published, &matched, &entries);
+        self.host.observe(AssemblyEvent::ScopeEnd(scope));
+        ChildEntry::scope(id, total)
+    }
+
+    fn install_replanned_children(
+        &mut self,
+        id: ScopeId,
+        published: &[ChildEntry],
+        matched: &[bool],
+        entries: &[ChildEntry],
+    ) {
+        let Some(tree) = self.tree.rewrites() else {
+            return;
+        };
+        for (entry, matched) in published.iter().zip(matched) {
+            if let (ChildKey::Scope(child), false) = (entry.key(), *matched) {
+                tree.detach_scope(child);
+            }
+        }
+        tree.set_children(id, entries);
+    }
+
+    fn record_scope_fresh(&mut self, id: ScopeId) -> ChildEntry {
+        let scope = self.rewritten_tree().scope_of(id);
+        let plan = self.host.plan_scope(scope);
+        if !plan.active {
+            self.host
+                .observe(AssemblyEvent::ScopeBegin(scope, ScopeAction::Inactive));
+            self.rewritten_tree().set_children(id, &[]);
+            self.host.observe(AssemblyEvent::ScopeEnd(scope));
+            return ChildEntry::scope(id, OutputSize::default());
+        }
+        self.host
+            .observe(AssemblyEvent::ScopeBegin(scope, ScopeAction::Recorded));
+        let mut entries: SmallVec<[ChildEntry; 16]> = SmallVec::with_capacity(plan.items.len());
+        let mut total = OutputSize::default();
+        for item in plan.items {
+            match item {
+                PaintOrderItem::Producer(producer) => {
+                    for kind in producer_kinds(producer) {
+                        let recorded = self.record_producer(scope.owner, kind);
+                        total.add(recorded.output());
+                        entries.push(recorded);
+                    }
+                }
+                PaintOrderItem::Scope(child_scope) => {
+                    let child = self.rewritten_tree().allocate_scope(child_scope, id);
+                    let recorded = self.record_scope_fresh(child);
+                    total.add(recorded.output());
+                    entries.push(recorded);
+                }
+            }
+        }
+        self.rewritten_tree().set_children(id, &entries);
+        self.host.observe(AssemblyEvent::ScopeEnd(scope));
+        ChildEntry::scope(id, total)
+    }
+
+    fn record_scope_outside_tree(&mut self, scope: PaintScope) -> OutputSize {
+        let plan = self.host.plan_scope(scope);
+        let mut total = OutputSize::default();
+        if !plan.active {
+            self.host
+                .observe(AssemblyEvent::ScopeBegin(scope, ScopeAction::Inactive));
+            self.host.observe(AssemblyEvent::ScopeEnd(scope));
+            return total;
+        }
+        self.host
+            .observe(AssemblyEvent::ScopeBegin(scope, ScopeAction::Recorded));
+        for item in plan.items {
+            match item {
+                PaintOrderItem::Producer(producer) => {
+                    for kind in producer_kinds(producer) {
+                        total.add(self.record_producer(scope.owner, kind).output());
+                    }
+                }
+                PaintOrderItem::Scope(child_scope) => total.add(self.record_scope_outside_tree(child_scope)),
+            }
+        }
+        self.host.observe(AssemblyEvent::ScopeEnd(scope));
+        total
+    }
+
+    fn record_producer(&mut self, owner: NodeSlotId, kind: ProducerKind) -> ChildEntry {
+        self.flush_pending_copy();
+        let before = self.host.output_position();
+        let outcome = self.host.record_producer(owner, kind);
+        let after = self.host.output_position();
+        let output = OutputSize {
+            bytes: after.bytes - before.bytes,
+            hits: after.hits - before.hits,
+            blocking_wheel_event_regions: after.blocking_wheel_event_regions - before.blocking_wheel_event_regions,
+            live: outcome.live,
+            reads_window_focus: outcome.reads_window_focus,
+        };
+        ChildEntry::producer(kind, output)
+    }
+
+    fn copy(&mut self, cursor: SourceCursor, output: OutputSize) {
+        debug_assert!(
+            self.source_prologue_bytes.is_some(),
+            "clean output is copied from a published recording"
+        );
+        let mut end = cursor;
+        end.advance(output);
+        match &mut self.pending_copy {
+            Some(pending) if pending.end == cursor => {
+                pending.end = end;
+                pending.blocking_wheel_event_regions += output.blocking_wheel_event_regions;
+            }
+            _ => {
+                self.flush_pending_copy();
+                self.pending_copy = Some(PendingCopy {
+                    start: cursor,
+                    end,
+                    blocking_wheel_event_regions: output.blocking_wheel_event_regions,
+                });
+            }
+        }
+    }
+
+    fn flush_pending_copy(&mut self) {
+        let Some(pending) = self.pending_copy.take() else {
+            return;
+        };
+        self.host.copy_published(
+            pending.start.bytes..pending.end.bytes,
+            pending.start.hits..pending.end.hits,
+            pending.blocking_wheel_event_regions,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::css::css_pixels::CssPixelRect;
+    use crate::painting::border_radii::BorderRadii;
+    use crate::painting::display_list::builder::RecordedDisplayList;
+    use crate::painting::display_list::commands::ContextRef;
+    use crate::painting::display_list::recorder::DisplayListRecorder;
+    use crate::painting::force_dark::ForceDarkRole;
+    use crate::painting::hit_test::{HitTestItem, HitTestItemKind, HitTestList};
+    use crate::painting::paint_order_plan::StackingContextPaintPhase;
+    use libgfx_rust::{Color, IntRect};
+    use std::collections::{HashMap, HashSet};
+
+    fn row(index: u32) -> NodeSlotId {
+        NodeSlotId::new(index, 1)
+    }
+
+    fn context(owner: NodeSlotId) -> PaintScope {
+        PaintScope::stacking_context(owner)
+    }
+
+    fn foreground(owner: NodeSlotId) -> PaintScope {
+        PaintScope {
+            owner,
+            kind: PaintScopeKind::Descendants(StackingContextPaintPhase::Foreground),
+        }
+    }
+
+    fn phase(phase: PaintPhase) -> PaintOrderItem {
+        PaintOrderItem::Producer(PaintProducer::BoxPhase(phase))
+    }
+
+    fn svg() -> PaintOrderItem {
+        PaintOrderItem::Producer(PaintProducer::SvgBoxForeground)
+    }
+
+    fn child(scope: PaintScope) -> PaintOrderItem {
+        PaintOrderItem::Scope(scope)
+    }
+
+    #[derive(Clone, Copy)]
+    struct Content {
+        rects: u32,
+        hits: u32,
+        version: u8,
+        live: bool,
+        blocking: u32,
+    }
+
+    fn content(rects: u32, hits: u32) -> Content {
+        Content {
+            rects,
+            hits,
+            version: 1,
+            live: false,
+            blocking: 0,
+        }
+    }
+
+    struct Frame {
+        display_list: RecordedDisplayList,
+        hit_test_items: Vec<HitTestItem>,
+        prologue_bytes: u32,
+        root_output: OutputSize,
+    }
+
+    struct Output {
+        recorder: DisplayListRecorder,
+        hit_test_list: HitTestList,
+        blocking_wheel_event_region_count: u32,
+    }
+
+    fn new_output() -> Output {
+        Output {
+            recorder: DisplayListRecorder::new(None),
+            hit_test_list: HitTestList::default(),
+            blocking_wheel_event_region_count: 0,
+        }
+    }
+
+    struct TestHost {
+        plans: HashMap<PaintScope, ScopePlan>,
+        contents: HashMap<(NodeSlotId, ProducerKind), Content>,
+        damage: HashMap<NodeSlotId, PaintDamage>,
+        moved_subtrees: HashSet<NodeSlotId>,
+        descendant_readers: HashSet<(NodeSlotId, ProducerKind)>,
+        recorded: Vec<(NodeSlotId, ProducerKind)>,
+        events: Vec<AssemblyEvent>,
+        output: Output,
+        source: Option<Frame>,
+    }
+
+    impl Default for TestHost {
+        fn default() -> Self {
+            Self {
+                plans: HashMap::new(),
+                contents: HashMap::new(),
+                damage: HashMap::new(),
+                moved_subtrees: HashSet::new(),
+                descendant_readers: HashSet::new(),
+                recorded: Vec::new(),
+                events: Vec::new(),
+                output: new_output(),
+                source: None,
+            }
+        }
+    }
+
+    impl TestHost {
+        fn plan(&mut self, scope: PaintScope, active: bool, items: &[PaintOrderItem]) {
+            self.plans.insert(
+                scope,
+                ScopePlan {
+                    active,
+                    items: items.iter().copied().collect(),
+                },
+            );
+        }
+
+        fn produce(&mut self, owner: NodeSlotId, kind: ProducerKind, content: Content) {
+            self.contents.insert((owner, kind), content);
+        }
+
+        fn push(&mut self, owner: NodeSlotId, damage: PaintDamage) {
+            *self.damage.entry(owner).or_default() |= damage;
+        }
+
+        fn clear_damage(&mut self) {
+            self.damage.clear();
+            self.moved_subtrees.clear();
+            self.recorded.clear();
+            self.events.clear();
+        }
+
+        fn recorded_kinds_of(&self, owner: NodeSlotId) -> Vec<ProducerKind> {
+            self.recorded
+                .iter()
+                .filter(|(recorded_owner, _)| *recorded_owner == owner)
+                .map(|(_, kind)| *kind)
+                .collect()
+        }
+    }
+
+    impl AssemblyHost for TestHost {
+        fn plan_scope(&mut self, scope: PaintScope) -> ScopePlan {
+            self.plans.get(&scope).cloned().unwrap_or_default()
+        }
+
+        fn record_producer(&mut self, owner: NodeSlotId, kind: ProducerKind) -> ProducerOutcome {
+            let Some(content) = self.contents.get(&(owner, kind)).copied() else {
+                return ProducerOutcome::default();
+            };
+            self.recorded.push((owner, kind));
+            let output = &mut self.output;
+            for index in 0..content.rects {
+                output.recorder.fill_rect(
+                    IntRect {
+                        x: owner.slot_index() as i32,
+                        y: kind.code() as i32 * 100 + index as i32,
+                        width: 10,
+                        height: i32::from(content.version),
+                    },
+                    Color::from_rgb(content.version, kind.code() as u8, 7),
+                    ForceDarkRole::Background,
+                );
+            }
+            for index in 0..content.hits {
+                output.hit_test_list.append(HitTestItem {
+                    kind: HitTestItemKind::Box,
+                    paintable: owner,
+                    hit_node: owner,
+                    chrome_widget_kind: 0,
+                    text_fragment_index: Some(index + u32::from(content.version) * 100),
+                    rect: CssPixelRect::default(),
+                    context: ContextRef::default(),
+                    border_radii: BorderRadii::default(),
+                    path: None,
+                    winding_rule: libgfx_rust::WindingRule::Nonzero,
+                    svg_hit_areas: 0,
+                    svg_stroke: None,
+                });
+            }
+            output.blocking_wheel_event_region_count += content.blocking;
+            ProducerOutcome {
+                live: content.live,
+                ..Default::default()
+            }
+        }
+
+        fn output_position(&self) -> OutputPosition {
+            OutputPosition {
+                bytes: self.output.recorder.byte_size() as u32,
+                hits: self.output.hit_test_list.items.len() as u32,
+                blocking_wheel_event_regions: self.output.blocking_wheel_event_region_count,
+            }
+        }
+
+        fn copy_published(&mut self, bytes: Range<u32>, hits: Range<u32>, blocking_wheel_event_regions: u32) {
+            let source = self.source.as_ref().expect("a published recording to copy from");
+            self.output.recorder.append_cached_commands(&source.display_list, bytes);
+            if !hits.is_empty() {
+                self.output
+                    .hit_test_list
+                    .append_copies_of(&source.hit_test_items[hits.start as usize..hits.end as usize]);
+            }
+            self.output.blocking_wheel_event_region_count += blocking_wheel_event_regions;
+        }
+
+        fn damaged_rows(&mut self) -> Vec<NodeSlotId> {
+            let mut rows: Vec<NodeSlotId> = self.damage.keys().copied().collect();
+            rows.extend(self.moved_subtrees.iter().copied());
+            rows.sort_unstable_by_key(|row| row.slot_index());
+            rows.dedup();
+            rows
+        }
+
+        fn effective_damage(&mut self, row: NodeSlotId) -> PaintDamage {
+            let mut damage = self.damage.get(&row).copied().unwrap_or_default();
+            if self.moved_subtrees.contains(&row) {
+                damage |= PaintDamage::ALL_PRODUCERS | PaintDamage::MOVED;
+            }
+            damage
+        }
+
+        fn producer_reads_descendants(&mut self, owner: NodeSlotId, kind: ProducerKind) -> bool {
+            self.descendant_readers.contains(&(owner, kind))
+        }
+
+        fn observe(&mut self, event: AssemblyEvent) {
+            self.events.push(event);
+        }
+    }
+
+    // Records the canvas prologue and assembles the viewport context from the host's source
+    // frame.
+    fn record_frame(host: &mut TestHost, tree: &mut PaintOrderTree) -> Frame {
+        record_frame_rewriting_tree(host, tree, true)
+    }
+
+    fn record_frame_rewriting_tree(host: &mut TestHost, tree: &mut PaintOrderTree, rewrites_tree: bool) -> Frame {
+        host.output = new_output();
+        host.output.recorder.fill_rect(
+            IntRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            },
+            Color::from_rgb(255, 255, 255),
+            ForceDarkRole::Background,
+        );
+        let prologue_bytes = host.output.recorder.byte_size() as u32;
+        let source_prologue_bytes = host.source.as_ref().map(|frame| frame.prologue_bytes);
+        let mut marks = ScopeMarks::default();
+        let access = match rewrites_tree {
+            true => PaintOrderTreeAccess::Rewrites(tree),
+            false => PaintOrderTreeAccess::Reads(tree),
+        };
+        let root_output =
+            Assembler::new(host, access, &mut marks, source_prologue_bytes, false).assemble_root(context(row(0)));
+        let output = std::mem::replace(&mut host.output, new_output());
+        let hit_test_items = std::sync::Arc::try_unwrap(output.hit_test_list.items).expect("items are unshared");
+        Frame {
+            display_list: output.recorder.into_builder().finish(),
+            hit_test_items,
+            prologue_bytes,
+            root_output,
+        }
+    }
+
+    // Assembles the next frame from the source frame and keeps it as the source in turn.
+    fn record_next_frame(host: &mut TestHost, tree: &mut PaintOrderTree) -> Frame {
+        let frame = record_frame(host, tree);
+        let previous = host.source.replace(Frame {
+            display_list: frame.display_list.clone(),
+            hit_test_items: frame.hit_test_items.clone(),
+            prologue_bytes: frame.prologue_bytes,
+            root_output: frame.root_output,
+        });
+        assert!(previous.is_some(), "a next frame copies from a first frame");
+        frame
+    }
+
+    fn assert_matches_from_scratch(host: &mut TestHost, assembled: &Frame) {
+        let recorded = std::mem::take(&mut host.recorded);
+        let events = std::mem::take(&mut host.events);
+        let source = host.source.take();
+        let mut fresh_tree = PaintOrderTree::default();
+        let fresh = record_frame(host, &mut fresh_tree);
+        host.source = source;
+        host.recorded = recorded;
+        host.events = events;
+        assert_eq!(
+            assembled.display_list.bytes, fresh.display_list.bytes,
+            "command bytes differ"
+        );
+        assert_eq!(assembled.display_list.command_runs, fresh.display_list.command_runs);
+        // Comparing whole items would compare their paths through the host's path equality.
+        let item_identities = |items: &[HitTestItem]| -> Vec<(NodeSlotId, Option<u32>)> {
+            items
+                .iter()
+                .map(|item| (item.paintable, item.text_fragment_index))
+                .collect()
+        };
+        assert_eq!(
+            item_identities(&assembled.hit_test_items),
+            item_identities(&fresh.hit_test_items)
+        );
+        assert_eq!(assembled.root_output, fresh.root_output);
+    }
+
+    // A viewport context (row 0) with a background and a foreground scope listing three
+    // card scopes (rows 1..=3) that each draw a background and a foreground with hit items.
+    fn cards_host() -> TestHost {
+        let mut host = TestHost::default();
+        host.plan(
+            context(row(0)),
+            true,
+            &[phase(PaintPhase::Background), child(foreground(row(0)))],
+        );
+        host.produce(row(0), ProducerKind::DrawBackground, content(1, 0));
+        host.plan(
+            foreground(row(0)),
+            true,
+            &[
+                child(foreground(row(1))),
+                child(foreground(row(2))),
+                child(foreground(row(3))),
+            ],
+        );
+        for card in 1..=3 {
+            host.plan(
+                foreground(row(card)),
+                true,
+                &[phase(PaintPhase::Background), phase(PaintPhase::Foreground)],
+            );
+            host.produce(row(card), ProducerKind::DrawBackground, content(1, 0));
+            host.produce(row(card), ProducerKind::HitForeground, content(0, 2));
+            host.produce(row(card), ProducerKind::DrawForeground, content(card, 0));
+        }
+        host
+    }
+
+    #[test]
+    fn a_quiet_frame_is_unchanged_and_a_fresh_frame_records_everything() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+        assert!(!frame_is_unchanged(&tree, false, false));
+
+        let frame = record_frame(&mut host, &mut tree);
+
+        assert_eq!(host.recorded.len(), 1 + 3 * 3);
+        assert_eq!(frame.root_output.hits, 6);
+        assert_eq!(frame.hit_test_items.len(), 6);
+        assert_eq!(
+            frame.root_output.bytes as usize,
+            frame.display_list.bytes.len() - frame.prologue_bytes as usize
+        );
+        assert!(frame_is_unchanged(&tree, false, false));
+        assert!(!frame_is_unchanged(&tree, true, false));
+    }
+
+    #[test]
+    fn one_damaged_producer_records_alone_and_the_rest_is_copied_in_two_runs() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        host.produce(row(2), ProducerKind::DrawForeground, content(2, 0));
+        host.contents
+            .get_mut(&(row(2), ProducerKind::DrawForeground))
+            .unwrap()
+            .version = 2;
+        host.push(row(2), PaintDamage::DRAW_FOREGROUND);
+        host.push(row(0), PaintDamage::DESCENDANT_READERS);
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert_eq!(host.recorded, vec![(row(2), ProducerKind::DrawForeground)]);
+        let copied_scopes: Vec<AssemblyEvent> = host
+            .events
+            .iter()
+            .copied()
+            .filter(|event| matches!(event, AssemblyEvent::ScopeCopied(_)))
+            .collect();
+        assert_eq!(copied_scopes.len(), 2);
+        assert_matches_from_scratch(&mut host, &second);
+    }
+
+    #[test]
+    fn a_growing_child_shifts_its_later_siblings_without_recording_them() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        host.produce(row(1), ProducerKind::DrawForeground, content(5, 0));
+        host.produce(row(1), ProducerKind::HitForeground, content(0, 4));
+        host.push(row(1), PaintDamage::DRAW_FOREGROUND | PaintDamage::HIT_FOREGROUND);
+        host.push(row(0), PaintDamage::DESCENDANT_READERS);
+        let grown = record_next_frame(&mut host, &mut tree);
+        assert_eq!(
+            host.recorded_kinds_of(row(1)),
+            vec![ProducerKind::HitForeground, ProducerKind::DrawForeground]
+        );
+        assert_eq!(host.recorded.len(), 2);
+        assert_eq!(grown.hit_test_items.len(), 8);
+        assert_matches_from_scratch(&mut host, &grown);
+        host.clear_damage();
+
+        host.produce(row(1), ProducerKind::DrawForeground, content(0, 0));
+        host.push(row(1), PaintDamage::DRAW_FOREGROUND);
+        host.push(row(0), PaintDamage::DESCENDANT_READERS);
+        let shrunk = record_next_frame(&mut host, &mut tree);
+        assert_eq!(host.recorded, vec![(row(1), ProducerKind::DrawForeground)]);
+        assert_matches_from_scratch(&mut host, &shrunk);
+    }
+
+    #[test]
+    fn a_replanned_parent_copies_kept_children_and_retires_the_removed_one() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        let removed = tree
+            .published_scope(
+                foreground(row(2)),
+                tree.published_scope(foreground(row(0)), tree.root()).unwrap(),
+            )
+            .unwrap();
+        host.clear_damage();
+
+        host.plan(
+            foreground(row(0)),
+            true,
+            &[child(foreground(row(3))), child(foreground(row(1)))],
+        );
+        host.push(row(0), PaintDamage::ORDER | PaintDamage::DESCENDANT_READERS);
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert!(host.recorded.is_empty());
+        assert_matches_from_scratch(&mut host, &second);
+        assert_eq!(second.hit_test_items.len(), 4);
+        let parent = tree.published_scope(foreground(row(0)), tree.root()).unwrap();
+        assert_eq!(tree.children(parent).len(), 2);
+        assert_eq!(tree.published_scope(foreground(row(2)), parent), None);
+        assert_eq!(tree.scope_count(), 4);
+        assert_ne!(tree.published_scope(foreground(row(3)), parent), Some(removed));
+    }
+
+    #[test]
+    fn a_new_child_is_recorded_under_the_replanned_parent() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        host.plan(
+            foreground(row(0)),
+            true,
+            &[
+                child(foreground(row(1))),
+                child(foreground(row(4))),
+                child(foreground(row(2))),
+                child(foreground(row(3))),
+            ],
+        );
+        host.plan(
+            foreground(row(4)),
+            true,
+            &[phase(PaintPhase::Background), phase(PaintPhase::Foreground)],
+        );
+        host.produce(row(4), ProducerKind::DrawBackground, content(2, 0));
+        host.produce(row(4), ProducerKind::HitForeground, content(0, 1));
+        host.push(row(4), PaintDamage::ORDER | PaintDamage::ALL_PRODUCERS);
+        host.push(row(0), PaintDamage::ORDER | PaintDamage::DESCENDANT_READERS);
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert_eq!(
+            host.recorded,
+            vec![
+                (row(4), ProducerKind::DrawBackground),
+                (row(4), ProducerKind::HitForeground)
+            ]
+        );
+        assert_matches_from_scratch(&mut host, &second);
+        assert_eq!(tree.scope_count(), 6);
+    }
+
+    #[test]
+    fn a_frame_that_publishes_nothing_copies_clean_output_and_leaves_the_tree_as_published() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+        let published_structure = tree.structure();
+        let published_root_entry = tree.root_entry();
+
+        host.produce(row(2), ProducerKind::DrawForeground, content(3, 0));
+        host.push(row(2), PaintDamage::DRAW_FOREGROUND);
+        let unpublished = record_frame_rewriting_tree(&mut host, &mut tree, false);
+
+        assert_eq!(host.recorded, vec![(row(2), ProducerKind::DrawForeground)]);
+        assert_matches_from_scratch(&mut host, &unpublished);
+        assert_eq!(tree.structure(), published_structure);
+        assert_eq!(tree.root_entry(), published_root_entry);
+
+        // The damage it read is still pending for the frame that publishes next.
+        host.recorded.clear();
+        let published = record_next_frame(&mut host, &mut tree);
+        assert_eq!(host.recorded, vec![(row(2), ProducerKind::DrawForeground)]);
+        assert_matches_from_scratch(&mut host, &published);
+        assert_eq!(published.display_list.bytes, unpublished.display_list.bytes);
+    }
+
+    #[test]
+    fn a_frame_that_publishes_nothing_records_a_new_child_outside_the_tree() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+        let published_structure = tree.structure();
+        let published_scope_count = tree.scope_count();
+
+        // Card 4 takes card 2's place.
+        host.plan(
+            foreground(row(0)),
+            true,
+            &[
+                child(foreground(row(1))),
+                child(foreground(row(4))),
+                child(foreground(row(3))),
+            ],
+        );
+        host.plan(
+            foreground(row(4)),
+            true,
+            &[phase(PaintPhase::Background), phase(PaintPhase::Foreground)],
+        );
+        host.produce(row(4), ProducerKind::DrawBackground, content(2, 0));
+        host.produce(row(4), ProducerKind::HitForeground, content(0, 1));
+        host.push(row(4), PaintDamage::ORDER | PaintDamage::ALL_PRODUCERS);
+        host.push(row(0), PaintDamage::ORDER | PaintDamage::DESCENDANT_READERS);
+        let unpublished = record_frame_rewriting_tree(&mut host, &mut tree, false);
+
+        assert_eq!(
+            host.recorded,
+            vec![
+                (row(4), ProducerKind::DrawBackground),
+                (row(4), ProducerKind::HitForeground)
+            ]
+        );
+        assert_matches_from_scratch(&mut host, &unpublished);
+        assert_eq!(tree.structure(), published_structure);
+        assert_eq!(tree.scope_count(), published_scope_count);
+
+        let published = record_next_frame(&mut host, &mut tree);
+        assert_matches_from_scratch(&mut host, &published);
+    }
+
+    #[test]
+    fn a_first_frame_that_publishes_nothing_leaves_the_tree_empty() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+
+        let frame = record_frame_rewriting_tree(&mut host, &mut tree, false);
+
+        assert!(tree.root().is_none());
+        assert_eq!(tree.scope_count(), 0);
+        assert_matches_from_scratch(&mut host, &frame);
+    }
+
+    #[test]
+    fn nested_damage_walks_only_the_damaged_path() {
+        let mut host = cards_host();
+        // Card 3 gets a nested scope of its own.
+        host.plan(
+            foreground(row(3)),
+            true,
+            &[
+                phase(PaintPhase::Background),
+                child(foreground(row(5))),
+                phase(PaintPhase::Foreground),
+            ],
+        );
+        host.plan(foreground(row(5)), true, &[phase(PaintPhase::Foreground)]);
+        host.produce(row(5), ProducerKind::DrawForeground, content(3, 0));
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        host.contents
+            .get_mut(&(row(5), ProducerKind::DrawForeground))
+            .unwrap()
+            .version = 9;
+        host.push(row(5), PaintDamage::DRAW_FOREGROUND);
+        for ancestor in [row(3), row(0)] {
+            host.push(ancestor, PaintDamage::DESCENDANT_READERS);
+        }
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert_eq!(host.recorded, vec![(row(5), ProducerKind::DrawForeground)]);
+        let assembled: Vec<PaintScope> = host
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                AssemblyEvent::ScopeBegin(scope, ScopeAction::Assembled) => Some(*scope),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assembled.len(),
+            4,
+            "viewport, its foreground, card 3 and its nested scope"
+        );
+        assert_matches_from_scratch(&mut host, &second);
+    }
+
+    #[test]
+    fn a_moved_subtree_records_every_producer_inside_it() {
+        let mut host = cards_host();
+        host.plan(
+            foreground(row(3)),
+            true,
+            &[phase(PaintPhase::Background), child(foreground(row(5)))],
+        );
+        host.plan(foreground(row(5)), true, &[phase(PaintPhase::Foreground)]);
+        host.produce(row(5), ProducerKind::DrawForeground, content(2, 0));
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        host.moved_subtrees.extend([row(3), row(5)]);
+        host.push(row(0), PaintDamage::DESCENDANT_READERS);
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert_eq!(
+            host.recorded,
+            vec![
+                (row(3), ProducerKind::DrawBackground),
+                (row(5), ProducerKind::DrawForeground)
+            ]
+        );
+        assert_matches_from_scratch(&mut host, &second);
+    }
+
+    #[test]
+    fn descendant_readers_record_when_something_below_them_changed() {
+        let mut host = cards_host();
+        host.plan(foreground(row(3)), true, &[svg(), child(foreground(row(5)))]);
+        host.produce(row(3), ProducerKind::Svg, content(1, 1));
+        host.descendant_readers.insert((row(3), ProducerKind::Svg));
+        host.plan(foreground(row(5)), true, &[phase(PaintPhase::Foreground)]);
+        host.produce(row(5), ProducerKind::DrawForeground, content(1, 0));
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        host.push(row(5), PaintDamage::DRAW_FOREGROUND);
+        host.push(row(3), PaintDamage::DESCENDANT_READERS);
+        host.push(row(0), PaintDamage::DESCENDANT_READERS);
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert_eq!(
+            host.recorded,
+            vec![(row(3), ProducerKind::Svg), (row(5), ProducerKind::DrawForeground)]
+        );
+        assert_matches_from_scratch(&mut host, &second);
+    }
+
+    #[test]
+    fn live_producers_record_every_frame_and_keep_the_frame_changing() {
+        let mut host = cards_host();
+        host.produce(
+            row(2),
+            ProducerKind::DrawBackground,
+            Content {
+                live: true,
+                ..content(1, 0)
+            },
+        );
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+        assert!(!frame_is_unchanged(&tree, false, false));
+
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert_eq!(host.recorded, vec![(row(2), ProducerKind::DrawBackground)]);
+        assert_matches_from_scratch(&mut host, &second);
+    }
+
+    #[test]
+    fn an_inactive_context_records_nothing_and_retires_its_children() {
+        let mut host = cards_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        let mut hidden = host.plans[&context(row(0))].clone();
+        hidden.active = false;
+        host.plans.insert(context(row(0)), hidden);
+        host.push(row(0), PaintDamage::ELIGIBILITY);
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert!(host.recorded.is_empty());
+        assert_eq!(second.root_output, OutputSize::default());
+        assert_eq!(second.display_list.bytes.len(), second.prologue_bytes as usize);
+        assert_eq!(tree.scope_count(), 1);
+        assert_matches_from_scratch(&mut host, &second);
+    }
+
+    #[test]
+    fn blocking_wheel_regions_are_counted_through_copies() {
+        let mut host = cards_host();
+        host.produce(
+            row(1),
+            ProducerKind::HitForeground,
+            Content {
+                blocking: 1,
+                ..content(0, 2)
+            },
+        );
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        assert_eq!(first.root_output.blocking_wheel_event_regions, 1);
+        assert_eq!(tree.root_entry().output().blocking_wheel_event_regions, 1);
+        host.source = Some(first);
+        host.clear_damage();
+
+        host.push(row(3), PaintDamage::DRAW_FOREGROUND);
+        host.push(row(0), PaintDamage::DESCENDANT_READERS);
+        let second = record_next_frame(&mut host, &mut tree);
+
+        assert_eq!(host.recorded, vec![(row(3), ProducerKind::DrawForeground)]);
+        assert_eq!(second.root_output.blocking_wheel_event_regions, 1);
+        assert_eq!(tree.root_entry().output().blocking_wheel_event_regions, 1);
+    }
+
+    struct Lcg(u32);
+
+    impl Lcg {
+        fn next(&mut self, limit: u32) -> u32 {
+            self.0 = self.0.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (self.0 >> 8) % limit
+        }
+    }
+
+    const CARD_ROWS: [u32; 6] = [1, 2, 3, 4, 5, 6];
+
+    fn nested_row(card: u32) -> Option<u32> {
+        matches!(card, 2 | 3 | 5).then_some(10 + card)
+    }
+
+    fn parent_row(row_index: u32) -> Option<u32> {
+        match row_index {
+            0 => None,
+            index if index >= 10 => Some(index - 10),
+            _ => Some(0),
+        }
+    }
+
+    fn push_with_hints(host: &mut TestHost, row_index: u32, damage: PaintDamage) {
+        host.push(row(row_index), damage);
+        let mut ancestor = parent_row(row_index);
+        while let Some(index) = ancestor {
+            host.push(row(index), PaintDamage::DESCENDANT_READERS);
+            ancestor = parent_row(index);
+        }
+    }
+
+    fn producer_kinds_of(host: &TestHost, row_index: u32) -> Vec<ProducerKind> {
+        let mut kinds: Vec<ProducerKind> = host
+            .contents
+            .keys()
+            .filter(|(owner, _)| *owner == row(row_index))
+            .map(|(_, kind)| *kind)
+            .collect();
+        kinds.sort_unstable_by_key(|kind| kind.code());
+        kinds
+    }
+
+    fn bump_version(host: &mut TestHost, row_index: u32, kind: ProducerKind) {
+        let content = host.contents.get_mut(&(row(row_index), kind)).unwrap();
+        content.version = content.version.wrapping_add(1).max(1);
+    }
+
+    // Six card contexts under the viewport foreground. Cards 2 and 5 nest a context of their
+    // own; card 3 paints an svg whose output depends on the foreground scope nested below it.
+    fn random_tree_host() -> TestHost {
+        let mut host = TestHost::default();
+        host.plan(
+            context(row(0)),
+            true,
+            &[phase(PaintPhase::Background), child(foreground(row(0)))],
+        );
+        host.produce(row(0), ProducerKind::DrawBackground, content(1, 0));
+        let cards: Vec<PaintOrderItem> = CARD_ROWS.iter().map(|card| child(context(row(*card)))).collect();
+        host.plan(foreground(row(0)), true, &cards);
+        for card in CARD_ROWS {
+            host.plan(
+                context(row(card)),
+                true,
+                &[phase(PaintPhase::Background), child(foreground(row(card)))],
+            );
+            host.produce(row(card), ProducerKind::DrawBackground, content(1, 0));
+            host.produce(row(card), ProducerKind::HitForeground, content(0, 2));
+            host.produce(row(card), ProducerKind::DrawForeground, content(card, 0));
+            let mut foreground_items = vec![phase(PaintPhase::Foreground)];
+            match nested_row(card) {
+                Some(nested) if card == 3 => {
+                    foreground_items = vec![svg(), child(foreground(row(nested)))];
+                    host.produce(row(card), ProducerKind::Svg, content(1, 1));
+                    host.descendant_readers.insert((row(card), ProducerKind::Svg));
+                    host.plan(foreground(row(nested)), true, &[phase(PaintPhase::Foreground)]);
+                    host.produce(row(nested), ProducerKind::DrawForeground, content(1, 0));
+                }
+                Some(nested) => {
+                    foreground_items.push(child(context(row(nested))));
+                    host.plan(
+                        context(row(nested)),
+                        true,
+                        &[phase(PaintPhase::Background), phase(PaintPhase::Foreground)],
+                    );
+                    host.produce(row(nested), ProducerKind::DrawBackground, content(2, 1));
+                    host.produce(row(nested), ProducerKind::DrawForeground, content(1, 0));
+                }
+                None => {}
+            }
+            host.plan(foreground(row(card)), true, &foreground_items);
+        }
+        host
+    }
+
+    // The svg of card 3 reads the scope nested below it, so a change there changes the svg's
+    // output without a push of its own.
+    fn change_content(host: &mut TestHost, random: &mut Lcg, row_index: u32) {
+        let kinds = producer_kinds_of(host, row_index);
+        let kind = kinds[random.next(kinds.len() as u32) as usize];
+        let content = host.contents.get_mut(&(row(row_index), kind)).unwrap();
+        match random.next(3) {
+            0 => content.version = content.version.wrapping_add(1).max(1),
+            1 if matches!(
+                kind,
+                ProducerKind::HitBackground | ProducerKind::HitForeground | ProducerKind::HitOverlay
+            ) =>
+            {
+                content.hits = random.next(4);
+            }
+            _ => content.rects = random.next(4),
+        }
+        push_with_hints(host, row_index, kind.damage());
+        if row_index == 13 {
+            bump_version(host, 3, ProducerKind::Svg);
+        }
+    }
+
+    // Random changes to the tree `random_tree_host` makes: to contents, to the cards listed and their order, to whether
+    // a card paints, and to where a card's subtree is.
+    struct RandomChanges {
+        random: Lcg,
+        listed: Vec<u32>,
+        removed: Vec<u32>,
+        inactive: HashSet<u32>,
+    }
+
+    impl RandomChanges {
+        fn new(seed: u32) -> Self {
+            Self {
+                random: Lcg(seed),
+                listed: CARD_ROWS.to_vec(),
+                removed: Vec::new(),
+                inactive: HashSet::new(),
+            }
+        }
+
+        fn plan_listed_cards(&self, host: &mut TestHost) {
+            let items: Vec<PaintOrderItem> = self.listed.iter().map(|card| child(context(row(*card)))).collect();
+            host.plan(foreground(row(0)), true, &items);
+            host.push(row(0), PaintDamage::ORDER);
+        }
+
+        fn apply(&mut self, host: &mut TestHost) {
+            let rows_with_content = [1, 2, 3, 4, 5, 6, 12, 13, 15];
+            for _ in 0..=self.random.next(3) {
+                match self.random.next(7) {
+                    0 | 1 => {
+                        let row_index = rows_with_content[self.random.next(rows_with_content.len() as u32) as usize];
+                        change_content(host, &mut self.random, row_index);
+                    }
+                    2 => {
+                        for index in (1..self.listed.len()).rev() {
+                            self.listed.swap(index, self.random.next(index as u32 + 1) as usize);
+                        }
+                        self.plan_listed_cards(host);
+                    }
+                    3 if self.listed.len() > 1 => {
+                        let card = self.listed.remove(self.random.next(self.listed.len() as u32) as usize);
+                        self.removed.push(card);
+                        self.plan_listed_cards(host);
+                    }
+                    4 if !self.removed.is_empty() => {
+                        let card = self
+                            .removed
+                            .remove(self.random.next(self.removed.len() as u32) as usize);
+                        self.listed
+                            .insert(self.random.next(self.listed.len() as u32 + 1) as usize, card);
+                        push_with_hints(host, card, PaintDamage::ORDER | PaintDamage::ALL_PRODUCERS);
+                        if let Some(nested) = nested_row(card) {
+                            push_with_hints(host, nested, PaintDamage::ORDER | PaintDamage::ALL_PRODUCERS);
+                        }
+                        self.plan_listed_cards(host);
+                    }
+                    5 => {
+                        let card = self.listed[self.random.next(self.listed.len() as u32) as usize];
+                        if !self.inactive.remove(&card) {
+                            self.inactive.insert(card);
+                        }
+                        host.plans.get_mut(&context(row(card))).unwrap().active = !self.inactive.contains(&card);
+                        push_with_hints(host, card, PaintDamage::ELIGIBILITY);
+                    }
+                    6 => {
+                        let card = self.listed[self.random.next(self.listed.len() as u32) as usize];
+                        let mut subtree = vec![card];
+                        subtree.extend(nested_row(card));
+                        for row_index in subtree {
+                            for kind in producer_kinds_of(host, row_index) {
+                                bump_version(host, row_index, kind);
+                            }
+                            host.moved_subtrees.insert(row(row_index));
+                        }
+                        push_with_hints(host, card, PaintDamage::MOVED);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn random_damage_over_a_synthetic_tree_always_matches_from_scratch() {
+        let mut changes = RandomChanges::new(0x2545_f491);
+        let mut host = random_tree_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        for step in 0..400 {
+            changes.apply(&mut host);
+
+            // Hit tests between two published frames record frames that publish nothing.
+            let published_structure = tree.structure();
+            for _ in 0..step % 3 {
+                let unpublished = record_frame_rewriting_tree(&mut host, &mut tree, false);
+                assert_matches_from_scratch(&mut host, &unpublished);
+                assert_eq!(tree.structure(), published_structure);
+            }
+
+            let frame = record_next_frame(&mut host, &mut tree);
+            assert_matches_from_scratch(&mut host, &frame);
+            host.clear_damage();
+            assert!(tree.scope_count() <= 32, "retired scopes are freed at once");
+        }
+    }
+
+    #[test]
+    fn frames_that_publish_nothing_match_from_scratch_as_damage_accumulates_over_them() {
+        let mut changes = RandomChanges::new(0x9e37_79b9);
+        let mut host = random_tree_host();
+        let mut tree = PaintOrderTree::default();
+        let first = record_frame(&mut host, &mut tree);
+        host.source = Some(first);
+        host.clear_damage();
+
+        for _ in 0..80 {
+            let published_structure = tree.structure();
+            let published_root_entry = tree.root_entry();
+            let removed_when_published = changes.removed.clone();
+            for _ in 0..6 {
+                changes.apply(&mut host);
+                // A card that left and comes back since the published frame is still in the tree, and what it published
+                // still stands: its parent's new order is all that changes.
+                if changes.random.next(2) == 0
+                    && let Some(position) = changes
+                        .removed
+                        .iter()
+                        .position(|card| !removed_when_published.contains(card))
+                {
+                    let card = changes.removed.remove(position);
+                    let at = changes.random.next(changes.listed.len() as u32 + 1) as usize;
+                    changes.listed.insert(at, card);
+                    changes.plan_listed_cards(&mut host);
+                }
+                let unpublished = record_frame_rewriting_tree(&mut host, &mut tree, false);
+                assert_matches_from_scratch(&mut host, &unpublished);
+                assert_eq!(tree.structure(), published_structure);
+                assert_eq!(tree.root_entry(), published_root_entry);
+                host.recorded.clear();
+                host.events.clear();
+            }
+
+            let frame = record_next_frame(&mut host, &mut tree);
+            assert_matches_from_scratch(&mut host, &frame);
+            host.clear_damage();
+        }
+    }
+}

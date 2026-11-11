@@ -1,0 +1,2 @@
+[add .match to non-adjacent later sibling]
+  styled <= 2: true

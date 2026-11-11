@@ -1,0 +1,86 @@
+$408635ca super-optional-call-this.js:1:1
+  Registers: 11
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+    [1] = String("method")
+
+block0:
+  [   0] Enter
+  [   8] GetLexicalEnvironment dst:reg4
+  [  10] Mov dst:reg5, src:Undefined
+  [  20] CreateLexicalEnvironment dst:reg7, parent:reg4, capacity:1, is_catch_environment:false
+  [  38] CreateVariable `Base`, is_immutable:true, is_global:false, is_strict:true
+  [  48] SetLexicalEnvironment environment:reg4
+  [  50] NewClass dst:reg6, class_environment:reg7, class_blueprint_index:0, element_keys:[element_keys:String("method")]
+  [  80] DynamicInitializeLexicalBinding `Base`, src:reg6
+  [  90] CreateLexicalEnvironment dst:reg7, parent:reg4, capacity:1, is_catch_environment:false
+  [  a8] CreateVariable `Foo`, is_immutable:true, is_global:false, is_strict:true
+  [  b8] GetGlobal value_feedback:0, dst:reg9, `Base`
+  [  c8] GetClassProtoParent dst:reg10, super_class:reg9
+  [  d8] SetLexicalEnvironment environment:reg4
+  [  e0] NewClass dst:reg6, super_class:reg9, proto_parent:reg10, class_environment:reg7, class_blueprint_index:1, element_keys:[element_keys:String("method")]
+  [ 110] DynamicInitializeLexicalBinding `Foo`, src:reg6
+  [ 120] GetGlobal value_feedback:1, dst:reg6, `Foo`
+  [ 130] CallConstruct value_feedback:2, call_feedback:0, dst:reg6, callee:reg6
+  [ 150] GetById value_feedback:3, dst:reg7, base:reg6, `method`
+  [ 168] Call value_feedback:4, call_feedback:1, dst:reg5, callee:reg7, this_value:reg6
+  [ 188] End value:reg5
+
+
+Foo$7d11cc86 super-optional-call-this.js:4:1
+  Registers: 8
+  Blocks:    1
+
+block0:
+  [   0] Enter
+  [   8] CreateRestParams dst:reg5, rest_index:0
+  [  18] GetSuperConstructor dst:reg6
+  [  20] SuperCallWithArgumentArray value_feedback:0, call_feedback:0, dst:reg7, super_constructor:reg6, arguments:reg5, is_synthetic:true
+  [  38] Return value:reg7
+
+
+Base$25c3a990
+  Registers: 5
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] End value:Undefined
+
+
+method$a45e002d super-optional-call-this.js:6:9
+  Registers: 7
+  Blocks:    4
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] ResolveThisBinding
+  [  10] ResolveSuperBase dst:reg5
+  [  18] GetByIdWithThis value_feedback:0, dst:reg6, base:reg5, `method`, this_value:this
+  [  30] JumpNullish condition:reg6, true_target:block2, false_target:block1
+
+block1:
+  [  40] Call value_feedback:1, call_feedback:0, dst:reg5, callee:reg6, this_value:this
+  [  60] Jump target:block3
+
+block2:
+  [  68] Mov dst:reg5, src:Undefined
+
+block3:
+  [  78] Return value:reg5
+
+
+method$ed84a6f2
+  Registers: 5
+  Blocks:    1
+  Constants:
+    [0] = Undefined
+
+block0:
+  [   0] Enter
+  [   8] End value:Undefined

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style>
+    #popover { color: rgb(1, 2, 3); }
+    #popover:popover-open { color: rgb(4, 5, 6); }
+</style>
+<div id="popover" popover="manual"></div>
+<script>
+    test(() => {
+        const popover = document.getElementById("popover");
+        internals.updateStyle();
+
+        internals.resetStyleCounters();
+        popover.showPopover();
+        internals.updateStyle();
+        println(`shown styled: ${internals.styleLastPass().styled}`);
+        internals.resetStyleCounters();
+        println("shown color: " + getComputedStyle(popover).color);
+        println(`shown read styled: ${internals.styleCounters().styledElements}`);
+
+        internals.resetStyleCounters();
+        popover.hidePopover();
+        internals.updateStyle();
+        println(`hidden styled: ${internals.styleLastPass().styled}`);
+        internals.resetStyleCounters();
+        println("hidden color: " + getComputedStyle(popover).color);
+        println(`hidden read styled: ${internals.styleCounters().styledElements}`);
+    });
+</script>

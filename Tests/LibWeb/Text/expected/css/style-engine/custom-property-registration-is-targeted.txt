@@ -1,0 +1,4 @@
+@property styled: 2, full pass: false
+unrelated registered initial value: 0px
+CSS.registerProperty() styled: 2, full passes: 0
+unrelated API initial value: 0px

@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<script src="../../include.js"></script>
+<style id="registrations">
+    .declarer { --registered: 12px; }
+    .reference { width: var(--registered); }
+</style>
+<div id="unrelated"></div>
+<div class="unrelated"></div>
+<div class="unrelated"></div>
+<div class="unrelated"></div>
+<div class="declarer"></div>
+<div class="reference"></div>
+<script>
+    test(() => {
+        const sheet = document.getElementById("registrations").sheet;
+        // The first CSSOM edit recompiles shared contents into a private stylesheet. Insert and remove
+        // a dummy rule before measuring, so the counters cover only subsequent incremental edits.
+        sheet.insertRule(":not(*) {}", 0);
+        sheet.deleteRule(0);
+
+        internals.updateStyle();
+        internals.resetStyleCounters();
+
+        document.getElementById("registrations").sheet.insertRule(
+            "@property --registered { syntax: '<length>'; inherits: false; initial-value: 0px; }"
+        );
+        document.getElementById("registrations").sheet.insertRule(":not(*) { color: red; }");
+        internals.updateStyle();
+
+        // The registration restyles at most the declarer and the reference.
+        const lastPass = internals.styleLastPass();
+        println(`@property styled: ${lastPass.styled.length}, full pass: ${lastPass.fullPass}`);
+        println(`unrelated registered initial value: ${getComputedStyle(unrelated).getPropertyValue("--registered")}`);
+
+        document.querySelector(".reference").remove();
+        const apiDeclarer = document.createElement("div");
+        apiDeclarer.style.setProperty("--api-registered", "14px");
+        document.body.appendChild(apiDeclarer);
+        const apiReference = document.createElement("div");
+        apiReference.style.width = "var(--api-registered)";
+        document.body.appendChild(apiReference);
+        internals.updateStyle();
+
+        internals.resetStyleCounters();
+        CSS.registerProperty({
+            name: "--api-registered",
+            syntax: "<length>",
+            inherits: false,
+            initialValue: "0px",
+        });
+        document.getElementById("registrations").sheet.insertRule(":not(*) { color: green; }");
+        internals.updateStyle();
+
+        // This registration restyles at most the API declarer and reference.
+        const counters = internals.styleCounters();
+        println(`CSS.registerProperty() styled: ${counters.styledElements}, full passes: ${counters.fullPasses}`);
+
+        println(`unrelated API initial value: ${getComputedStyle(unrelated).getPropertyValue("--api-registered")}`);
+    });
+</script>

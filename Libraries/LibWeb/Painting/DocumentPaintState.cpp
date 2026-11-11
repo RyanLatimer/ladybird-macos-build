@@ -1,0 +1,394 @@
+/*
+ * Copyright (c) 2026, Aliaksandr Kalenik <kalenik.aliaksandr@gmail.com>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibWeb/CSS/HighlightRegistry.h>
+#include <LibWeb/CSS/StyleComputer.h>
+#include <LibWeb/DOM/Document.h>
+#include <LibWeb/DOM/EventTarget.h>
+#include <LibWeb/DOM/Range.h>
+#include <LibWeb/DOM/Text.h>
+#include <LibWeb/Editing/SpellingMarkers.h>
+#include <LibWeb/HTML/LocalNavigable.h>
+#include <LibWeb/HTML/Window.h>
+#include <LibWeb/Layout/TextNode.h>
+#include <LibWeb/Layout/Viewport.h>
+#include <LibWeb/Page/Page.h>
+#include <LibWeb/Painting/BoxViews.h>
+#include <LibWeb/Painting/DocumentPaintState.h>
+#include <LibWeb/Painting/PaintingRustBridge.h>
+#include <LibWeb/Painting/SvgPaintResources.h>
+
+namespace Web::Painting {
+
+DocumentPaintState::DocumentPaintState(Layout::NodeArena& layout_node_arena)
+    : m_layout_node_arena(layout_node_arena)
+{
+    // The render state keeps the scroll state, and outlives the layout tree this paint state is for.
+    Layout::RustFFI::render_state_forget_scroll_state(m_layout_node_arena->host());
+}
+
+void DocumentPaintState::ensure_visual_context_tree(DOM::Document const& document) const
+{
+    const_cast<DOM::Document&>(document).update_paint_and_hit_testing_properties_if_needed();
+}
+
+bool DocumentPaintState::has_visual_context_tree(Layout::BegunRead const& read) const
+{
+    return Layout::RustFFI::render_state_has_visual_context_tree(m_layout_node_arena->host(), &read);
+}
+
+Compositing::AccumulatedVisualContextTree DocumentPaintState::visual_context_tree_without_update(Layout::BegunRead const& read, DOM::Document const& document) const
+{
+    return Compositing::AccumulatedVisualContextTree::adopt_rust_handle(retain_rust_main_visual_context_tree(read, document));
+}
+
+Compositing::AccumulatedVisualContextTree DocumentPaintState::visual_context_tree(DOM::Document const& document) const
+{
+    ensure_visual_context_tree(document);
+    Layout::ForcedReadScope read { document };
+    return visual_context_tree_without_update(read, document);
+}
+
+u64 DocumentPaintState::visual_context_tree_structural_epoch_without_update(Layout::BegunRead const& read) const
+{
+    return Layout::RustFFI::render_state_visual_context_tree_structural_epoch(m_layout_node_arena->host(), &read);
+}
+
+BlockingWheelEventRegionState DocumentPaintState::collect_root_blocking_wheel_event_regions(DOM::Document& document)
+{
+    GC::Ptr<DOM::EventTarget> roots[] = {
+        document.navigable() ? document.navigable()->active_window() : nullptr,
+        &document,
+        document.document_element(),
+        document.body(),
+    };
+    for (auto target : roots) {
+        if (target && target->has_blocking_wheel_event_listener()) {
+            return {
+                .has_blocking_wheel_event_listeners = true,
+                .has_blocking_wheel_event_region_covering_viewport = true,
+            };
+        }
+    }
+    return {};
+}
+
+void DocumentPaintState::viewport_row_was_reset()
+{
+    Layout::RustFFI::render_state_forget_scroll_state(m_layout_node_arena->host());
+    m_boxes_with_auto_content_visibility.clear();
+    m_visual_context_tree_needs_compositor_update = false;
+}
+
+void DocumentPaintState::update_accumulated_visual_contexts(Layout::BegunRead const& read, DOM::Document& document)
+{
+    bool svg_paint_resources_changed = sync_svg_paint_resources(read, document);
+    auto result = rust_update_accumulated_visual_contexts(read, document);
+    if (result.performed_full_build)
+        ++m_accumulated_visual_context_tree_build_count;
+    else
+        ++m_accumulated_visual_context_tree_incremental_update_count;
+    if (result.requires_display_list_recording || svg_paint_resources_changed)
+        document.set_needs_to_record_display_list();
+    if (result.values_may_have_changed)
+        m_visual_context_tree_needs_compositor_update = true;
+}
+
+void DocumentPaintState::update_visual_viewport_accumulated_visual_context(Layout::BegunRead const& read, DOM::Document& document)
+{
+    if (!has_visual_context_tree(read)) {
+        update_accumulated_visual_contexts(read, document);
+        return;
+    }
+    rust_update_visual_viewport_transform(read, document);
+    m_visual_context_tree_needs_compositor_update = true;
+}
+
+void DocumentPaintState::begin_compositor_animation_update(DOM::Document& document)
+{
+    ensure_visual_context_tree(document);
+    Layout::RustFFI::render_state_begin_compositor_animation_update(m_layout_node_arena->host());
+}
+
+void DocumentPaintState::publish_compositor_animations(Layout::BegunRead const& read, DOM::Document& document, PublishPendingCompositorAnimations publish_pending)
+{
+    ensure_visual_context_tree(document);
+    auto outcome = Layout::RustFFI::render_state_publish_compositor_animations(m_layout_node_arena->host(), &read, publish_pending == PublishPendingCompositorAnimations::Yes);
+    if (!outcome.published)
+        return;
+    m_visual_context_tree_needs_compositor_update = true;
+    if (outcome.parameters_changed)
+        ++document.style_invalidation_counters().compositor_visual_animation_updates;
+    if (outcome.timing_anchors_changed)
+        ++document.style_invalidation_counters().compositor_visual_animation_timing_anchor_updates;
+}
+
+void DocumentPaintState::republish_visual_animations(Layout::BegunRead const& read, DOM::Document& document)
+{
+    if (!Layout::RustFFI::render_state_visual_context_tree_has_visual_animations(m_layout_node_arena->host(), &read))
+        return;
+    m_visual_context_tree_needs_compositor_update = true;
+    ++document.style_invalidation_counters().compositor_visual_animation_updates;
+}
+
+void DocumentPaintState::append_paint_command_cache_source_resources(Compositing::DisplayListResourceSet& retained_resources) const
+{
+    retained_resources.include(m_paint_command_cache_source_referenced_resources);
+}
+
+RequiresDisplayListRecording DocumentPaintState::refresh_scroll_state(Layout::BegunRead const& read, DOM::Document& document)
+{
+    auto outcome = Layout::RustFFI::render_state_refresh_scroll_state(
+        m_layout_node_arena->host(), &read, document.page().client().device_pixels_per_css_pixel(),
+        document.page().css_to_device_rect(document.viewport_rect()).size().to_type<int>());
+    if (outcome.scroll_state_changed)
+        m_scroll_state_changed = true;
+    if (outcome.table_changed)
+        did_update_visual_context_values();
+    return outcome.requires_display_list_recording ? RequiresDisplayListRecording::Yes : RequiresDisplayListRecording::No;
+}
+
+Layout::RustFFI::FfiViewportMapping DocumentPaintState::viewport_mapping(Compositing::AccumulatedVisualContextTree const& visual_context_tree, double device_pixels_per_css_pixel) const
+{
+    Layout::RustFFI::FfiViewportMapping mapping {};
+    Layout::RustFFI::render_state_viewport_mapping(m_layout_node_arena->host(), visual_context_tree.rust_handle(), static_cast<float>(device_pixels_per_css_pixel), &mapping);
+    return mapping;
+}
+
+ByteBuffer DocumentPaintState::encoded_scroll_state() const
+{
+    ByteBuffer bytes;
+    Layout::RustFFI::render_state_encode_scroll_state(m_layout_node_arena->host(), &bytes, [](void* sink, u8 const* data, size_t size) {
+        MUST(static_cast<ByteBuffer*>(sink)->try_append(data, size));
+    });
+    return bytes;
+}
+
+void DocumentPaintState::reset_selection_states(Layout::BegunRead const& read, DOM::Document& document)
+{
+    Layout::RustFFI::render_state_clear_selection(m_layout_node_arena->host(), viewport_row_slot(read, document));
+}
+
+static void append_highlight_entry(Layout::BegunRead const& read, Vector<Layout::RustFFI::FfiSelectionEntry>& entries, DOM::Node& container, SelectionState state)
+{
+    if (is<DOM::Text>(container)) {
+        if (auto* layout_node = container.unsafe_layout_node(read)) {
+            entries.append({
+                .is_text_node_entry = true,
+                .layout_node = Layout::Node::slot_id(layout_node),
+                .state = to_underlying(state),
+            });
+        }
+        return;
+    }
+    if (auto* layout_node = container.unsafe_layout_node(read)) {
+        if (has_committed_box(*layout_node)) {
+            entries.append({
+                .is_text_node_entry = false,
+                .layout_node = Layout::Node::slot_id(layout_node),
+                .state = to_underlying(state),
+            });
+        }
+    }
+}
+
+template<typename IsExcluded, typename Callback>
+static void for_each_node_in_highlight_range(Layout::BegunRead const& read, DOM::AbstractRange const& range, IsExcluded is_excluded, Callback callback)
+{
+    auto start_container = range.start_container();
+    auto end_container = range.end_container();
+
+    // 2. If the selection starts and ends in the same node:
+    if (start_container == end_container) {
+        // 1. If the selection starts and ends at the same offset, return.
+        if (range.start_offset() == range.end_offset()) {
+            // NOTE: A zero-length selection should not be visible.
+            return;
+        }
+
+        // 2. If it's a text node, mark it as StartAndEnd and return.
+        if (is<DOM::Text>(*start_container) && !is_excluded(*start_container)) {
+            callback(*start_container, SelectionState::StartAndEnd);
+            return;
+        }
+    }
+
+    // 3. Mark the selection start node as Start (if text) or Full (if anything else).
+    if (!is_excluded(*start_container) && start_container->unsafe_layout_node(read)) {
+        if (is<DOM::Text>(*start_container))
+            callback(*start_container, SelectionState::Start);
+        else
+            callback(*start_container, SelectionState::Full);
+    }
+
+    // 4. Mark the nodes between the start and end of the selection as Full.
+    auto* start_at = start_container->child_at_index(range.start_offset());
+    // If the start container has no child at that index, nothing of what it holds is in the range, and we need to start
+    // on the node right after it. If the end container holds nothing after it, there is no node to mark.
+    if (!start_at) {
+        for (auto* node = start_container.ptr(); node && node != end_container.ptr() && !start_at; node = node->parent())
+            start_at = node->next_sibling();
+    }
+
+    DOM::Node* stop_at = end_container->child_at_index(range.end_offset());
+    // Only stop at the end container if it has no children that may need to be included.
+    for (auto* node = start_at; node && (node != stop_at && !(node == end_container.ptr() && !end_container->has_children())); node = node->next_in_pre_order(end_container.ptr())) {
+        if (is_excluded(*node))
+            continue;
+        callback(*node, SelectionState::Full);
+    }
+
+    // 5. Mark the selection end node as End if it is a text node.
+    if (!is_excluded(*end_container) && is<DOM::Text>(*end_container) && end_container->unsafe_layout_node(read)) {
+        callback(*end_container, SelectionState::End);
+    }
+}
+
+void DocumentPaintState::recompute_selection_states(Layout::BegunRead const& read, DOM::Document& document, DOM::Range& range)
+{
+    // https://drafts.csswg.org/css-ui/#valdef-user-select-none
+    // "The content of the element must be excluded from selection by [...] the selection methods of the Selection API
+    // and the like." We honor this by leaving such nodes at SelectionState::None — even when they fall inside the
+    // range. So, the selection highlight skips them.
+    auto is_excluded_from_selection = [&read](DOM::Node const& node) {
+        if (node.is_inert())
+            return true;
+        auto const* layout = node.unsafe_layout_node(read);
+        return layout && layout->user_select_used_value() == CSS::UserSelect::None;
+    };
+
+    Vector<Layout::RustFFI::FfiSelectionEntry> entries;
+    for_each_node_in_highlight_range(read, range, is_excluded_from_selection, [&](DOM::Node& node, SelectionState state) {
+        append_highlight_entry(read, entries, node, state);
+    });
+    Layout::RustFFI::render_state_apply_selection(m_layout_node_arena->host(), viewport_row_slot(read, document), entries.span(), range.start_offset(), range.end_offset());
+}
+
+void DocumentPaintState::reset_search_text_states()
+{
+    Layout::RustFFI::render_state_clear_search_text(m_layout_node_arena->host());
+}
+
+void DocumentPaintState::recompute_search_text_states(Layout::BegunRead const& read, DOM::Document& document, GC::Ptr<DOM::Range> active_match, Vector<GC::Ref<DOM::Range>> const& highlighted_matches)
+{
+    auto is_excluded_from_search_text = [](DOM::Node const&) { return false; };
+
+    Vector<Layout::RustFFI::FfiSearchTextRange> ranges;
+    Vector<Layout::RustFFI::FfiSelectionEntry> entries;
+    auto append_range = [&](DOM::Range& range, bool is_current) {
+        auto first_entry = entries.size();
+        for_each_node_in_highlight_range(read, range, is_excluded_from_search_text, [&](DOM::Node& node, SelectionState state) {
+            if (is<DOM::Text>(node))
+                append_highlight_entry(read, entries, node, state);
+        });
+        if (entries.size() == first_entry)
+            return;
+        ranges.append({
+            .first_entry = first_entry,
+            .entry_count = entries.size() - first_entry,
+            .start_offset = range.start_offset(),
+            .end_offset = range.end_offset(),
+            .is_current = is_current,
+        });
+    };
+    for (auto const& match : highlighted_matches) {
+        if (match.ptr() != active_match.ptr())
+            append_range(*match, false);
+    }
+    if (active_match)
+        append_range(*active_match, true);
+    Layout::RustFFI::render_state_apply_search_text(m_layout_node_arena->host(), viewport_row_slot(read, document), ranges.span(), entries.span());
+}
+
+// https://dom.spec.whatwg.org/#contained
+// A node node is contained in a live range range if node’s root is range’s root, and (node, 0) is after range’s
+// start, and (node, node’s length) is before range’s end.
+static bool range_contains_node(DOM::AbstractRange const& range, DOM::Node& node)
+{
+    if (&node.root() != &range.start_container()->root())
+        return false;
+    auto length = static_cast<WebIDL::UnsignedLong>(node.length());
+    return DOM::position_of_boundary_point_relative_to_other_boundary_point({ node, 0 }, range.start()) == DOM::RelativeBoundaryPointPosition::After
+        && DOM::position_of_boundary_point_relative_to_other_boundary_point({ node, length }, range.end()) == DOM::RelativeBoundaryPointPosition::Before;
+}
+
+void DocumentPaintState::reset_custom_highlight_states()
+{
+    Layout::RustFFI::render_state_clear_custom_highlights(m_layout_node_arena->host());
+}
+
+void DocumentPaintState::recompute_custom_highlight_states(Layout::BegunRead const& read, DOM::Document& document, CSS::HighlightRegistry& registry)
+{
+    auto& style_engine = document.style_computer().style_engine();
+    Vector<u32> layers;
+    Vector<Layout::RustFFI::FfiCustomHighlightTextEntry> text_entries;
+    Vector<Layout::RustFFI::FfiCustomHighlightReplacedEntry> replaced_entries;
+    auto is_excluded = [](DOM::Node const&) { return false; };
+    registry.for_each_highlight_in_stacking_order([&](Utf16String const& name, ReadonlySpan<GC::Ref<DOM::AbstractRange>> ranges) {
+        auto layer = static_cast<u32>(layers.size());
+        bool covers_something = false;
+        for (auto const& range : ranges) {
+            if (!CSS::HighlightRegistry::range_is_paintable(document, *range))
+                continue;
+            for_each_node_in_highlight_range(read, *range, is_excluded, [&](DOM::Node& node, SelectionState state) {
+                auto* layout_node = node.unsafe_layout_node(read);
+                if (!layout_node)
+                    return;
+                if (is<DOM::Text>(node)) {
+                    bool starts_in_node = state == SelectionState::Start || state == SelectionState::StartAndEnd;
+                    bool ends_in_node = state == SelectionState::End || state == SelectionState::StartAndEnd;
+                    text_entries.append({
+                        .layer = layer,
+                        .layout_node = Layout::Node::slot_id(layout_node),
+                        .start_offset = starts_in_node ? range->start_offset() : 0,
+                        .end_offset = ends_in_node ? range->end_offset() : NumericLimits<size_t>::max(),
+                    });
+                    covers_something = true;
+                    return;
+                }
+                if (layout_node->kind() == Layout::RustFFI::NodeKind::ImageBox && has_committed_box(*layout_node) && range_contains_node(*range, node)) {
+                    replaced_entries.append({
+                        .layer = layer,
+                        .layout_node = Layout::Node::slot_id(layout_node),
+                    });
+                    covers_something = true;
+                }
+            });
+        }
+        if (covers_something)
+            layers.append(style_engine.intern_atom(Utf16FlyString { name }).value());
+    });
+    if (text_entries.is_empty() && replaced_entries.is_empty()) {
+        reset_custom_highlight_states();
+        return;
+    }
+    Layout::RustFFI::render_state_apply_custom_highlights(m_layout_node_arena->host(), viewport_row_slot(read, document), layers.span(), text_entries.span(), replaced_entries.span());
+}
+
+void DocumentPaintState::reset_spelling_error_states()
+{
+    Layout::RustFFI::render_state_clear_spelling_errors(m_layout_node_arena->host());
+}
+
+void DocumentPaintState::recompute_spelling_error_states(Layout::BegunRead const& read, DOM::Document& document, Editing::SpellingMarkers& markers)
+{
+    Vector<Layout::RustFFI::FfiSpellingError> errors;
+    markers.for_each_marked_text([&](DOM::Text& text, ReadonlySpan<Editing::SpellingMarker> text_markers) {
+        auto* layout_node = text.unsafe_layout_node(read);
+        if (!layout_node)
+            return;
+        for (auto const& marker : text_markers) {
+            errors.append({
+                .layout_node = Layout::Node::slot_id(layout_node),
+                .start_offset = marker.start,
+                .end_offset = marker.end,
+            });
+        }
+    });
+    Layout::RustFFI::render_state_apply_spelling_errors(m_layout_node_arena->host(), viewport_row_slot(read, document), errors.span());
+}
+
+}

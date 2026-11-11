@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<script src="../../include.js"></script>
+<script src="structural-matrix.js"></script>
+<script>
+    test(() => {
+        const host = makeElement("div");
+        document.body.appendChild(host);
+        const shadowRoot = host.attachShadow({ mode: "open" });
+        const slot = document.createElement("slot");
+        shadowRoot.appendChild(slot);
+        const slotted = makeElement("div");
+        host.appendChild(slotted);
+        document.body.offsetWidth;
+        internals.updateStyle();
+
+        // Matching a selector answers from the styles the elements have and styles nothing.
+        resetStyleCounters();
+        assertEqual("slot matches ::slotted", slot.matches("::slotted(:has(.hit))"), false);
+        printPassWithStyleCounters("matching ::slotted() against a shadow tree slot", 0);
+
+        resetStyleCounters();
+        assertEqual("slotted element matches ::slotted", slotted.matches("::slotted(:has(.hit))"), false);
+        printPassWithStyleCounters("matching ::slotted() against a slotted element", 0);
+
+        resetStyleCounters();
+        assertEqual("slotted element matches simple ::slotted", slotted.matches("::slotted(div)"), false);
+        printPassWithStyleCounters("matching simple ::slotted() against a slotted element", 0);
+
+        host.remove();
+    });
+</script>
