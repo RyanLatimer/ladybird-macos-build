@@ -223,7 +223,7 @@ jobs:
           ls -lh Ladybird-macOS-arm64.*
 
       - name: Upload Ladybird.app (zip)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Ladybird-macOS-arm64-zip
           path: Install/bundle/Ladybird-macOS-arm64.zip
@@ -231,7 +231,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Ladybird.app (dmg)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Ladybird-macOS-arm64-dmg
           path: Install/bundle/Ladybird-macOS-arm64.dmg
@@ -239,7 +239,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Ladybird.app (tar.xz)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Ladybird-macOS-arm64-tarxz
           path: Install/bundle/Ladybird-macOS-arm64.tar.xz
