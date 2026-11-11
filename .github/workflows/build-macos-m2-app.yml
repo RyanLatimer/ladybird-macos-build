@@ -245,3 +245,5 @@ jobs:
           path: Install/bundle/Ladybird-macOS-arm64.tar.xz
           compression-level: 0
           if-no-files-found: error
+
+# Index refresh: keep this workflow registered on the build mirror.
